@@ -1,0 +1,64 @@
+name: ScoreKit PDF print stage
+description: Build printable parts first and publish PDF archive immediately
+inputs:
+  source_tag:
+    description: Git release tag when building a release
+    required: false
+    default: ''
+runs:
+  using: composite
+  steps:
+      - name: Trust checkout Git directory and verify revision in container
+        if: env.SCOREKIT_IMAGE_MODE == '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git -C "$GITHUB_WORKSPACE" rev-parse --verify HEAD
+          git -C "$GITHUB_WORKSPACE" describe --tags --always --long --abbrev=8 --match 'v[0-9]*'
+      - name: Verify prepared CI image for printing
+        if: env.SCOREKIT_IMAGE_MODE == '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v lilypond
+          lilypond --version | head -n 1
+          fc-match "TeX Gyre Termes" | grep -qi "texgyre"
+      - name: Install pinned LilyPond from ScoreKit (legacy Ubuntu)
+        if: env.SCOREKIT_IMAGE_MODE != '1'
+        uses: ./scorekit/actions/install-lilypond
+      - name: Use preinstalled score fonts or install them on a plain runner
+        if: env.SCOREKIT_IMAGE_MODE != '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v fc-match >/dev/null 2>&1 && fc-match "TeX Gyre Termes" | grep -qi "texgyre"; then
+            echo "TeX Gyre is already installed; skip APT"
+            exit 0
+          fi
+          # Fallback when running without the prepared CI image.
+          if ! timeout 120s sudo apt-get update -o Acquire::Retries=0 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20; then
+            sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+            timeout 120s sudo apt-get update -o Acquire::Retries=0 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20
+          fi
+          timeout 180s sudo apt-get install -y --no-install-recommends -o Acquire::Retries=1 -o Acquire::http::Timeout=30 fonts-texgyre
+      - name: Build and package printable PDFs
+        shell: bash
+        env:
+          SOURCE_TAG: ${{ inputs.source_tag }}
+        run: |
+          set -euo pipefail
+          SCOREKIT_FAST_PDF=1 python3 scorekit/scripts/build.py build
+          python3 scorekit/scripts/build.py package
+      - name: Upload early PDF bundle
+        uses: actions/upload-artifact@v6
+        with:
+          name: score-pdf-${{ github.sha }}
+          path: |
+            dist/pdf/*.pdf
+            dist/packages/*-pdf-*.zip
+            dist/print-manifest.json
+            build/build-info.json
+            build/score-indent.json
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="ru"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>ScoreKit — Просмотр партитуры</title>
+<style>
+:root{font-family:system-ui,-apple-system,"Segoe UI",Arial,sans-serif;color:#203044;background:#f4f5f9}
+*{box-sizing:border-box}
+body{margin:0;height:100dvh;display:flex;flex-direction:column;overflow:hidden}
+header{padding:8px 12px;background:#fff;border-bottom:1px solid #dce1ea;flex:none;z-index:5}
+button,select,input{font:inherit}
+select,button{padding:7px 9px;border-radius:6px;border:1px solid #a9b3c2;background:#fff}
+button{cursor:pointer}button:disabled,select:disabled{opacity:.5;cursor:default}
+.titlebar{display:grid;grid-template-columns:34px minmax(0,1fr) 34px;gap:8px;align-items:center;margin-bottom:6px}
+#headingGroup{text-align:center;min-width:0}
+h1{font-size:18px;line-height:1.25;margin:0;font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#orchestraLine{font-size:11px;color:#64748b;margin:2px 0 0}
+.catalog-link{display:flex;align-items:center;justify-content:center;width:32px;height:32px;border-radius:8px;color:#1760a1;text-decoration:none}
+.catalog-link:hover:not([aria-disabled="true"]),.side-toggle:hover{background:#ecf2f8}
+.catalog-link[aria-disabled="true"]{opacity:.45;cursor:default}
+.catalog-link svg,.side-toggle svg{width:19px;height:19px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.side-toggle{width:34px;height:34px;padding:6px;border:0;display:flex;align-items:center;justify-content:center;color:#40546a}
+.row{display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:nowrap;min-width:0}
+.picker,.measure-seek{display:flex;align-items:center;gap:5px;min-width:0;font-size:13px;white-space:nowrap}
+.picker{flex:1 1 160px;min-width:94px}
+.picker select{min-width:0;width:100%;height:36px;font-size:13px}
+#audio-cluster{display:flex;align-items:center;gap:3px;flex:2.5 1 330px;min-width:285px}
+audio{display:none}
+#mediaControls{display:flex;align-items:center;gap:5px;flex:1 1 230px;width:100%;min-width:190px;height:38px;border-radius:22px;background:#f1f3f4;padding:2px 8px}
+.media-button{flex:none;display:inline-flex;justify-content:center;align-items:center;width:28px;height:28px;padding:0;border:0;border-radius:50%;background:transparent;font-size:16px;color:#263648}
+.media-button:hover{background:#dfe5ed}
+#mediaSeek{flex:1;min-width:30px;width:60px;accent-color:#1760a1}
+#mediaTime{white-space:nowrap;font-size:12px;font-variant-numeric:tabular-nums;color:#263648}
+#notationPane{position:relative;flex:1;min-width:0;min-height:0}
+#zoomControls{position:absolute;right:20px;top:10px;z-index:8;display:flex;align-items:center;gap:3px;background:rgba(255,255,255,.96);border:1px solid #d9e0eb;border-radius:9px;padding:4px 6px;box-shadow:0 2px 12px #14203624}
+#zoomControls button{width:28px;height:28px;border:0;border-radius:5px;background:transparent;padding:3px;font-weight:600}
+#zoomControls button:hover{background:#eaf0f8}
+#zoomSlider{width:78px;accent-color:#1760a1}
+#zoomValue{min-width:37px;text-align:right;font-size:12px;font-variant-numeric:tabular-nums;color:#425269}
+#zoomFit{font-size:17px}
+#restart{width:36px;height:36px;display:inline-flex;align-items:center;justify-content:center;flex:none;border:0;border-radius:50%;background:#f1f3f4;color:#263648;padding:6px}
+#restart:hover{background:#e0e5eb}
+#restart:focus-visible,.catalog-link:focus-visible,.side-toggle:focus-visible{outline:2px solid #1760a1;outline-offset:2px}
+#restart svg{width:19px;height:19px;fill:currentColor}
+#mixerDetails{position:relative;flex:none}
+#mixerDetails>summary{position:relative;display:flex;align-items:center;justify-content:center;cursor:pointer;border:1px solid #c3cbd7;border-radius:7px;width:38px;height:36px;padding:7px;list-style:none;background:#f7f9fc;color:#2b4665}
+#mixerDetails>summary svg{width:21px;height:21px;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;fill:none}
+#mixerCount{position:absolute;top:-6px;right:-6px;min-width:16px;height:16px;border-radius:9px;background:#1760a1;color:white;text-align:center;font-size:10px;line-height:16px;padding:0 3px}
+#mixerCount[hidden]{display:none}
+#mixerDetails>summary::-webkit-details-marker{display:none}
+#mixerDetails[open]>summary,#mixerDetails>summary:hover{background:#e8eef7}
+#mixerPanel{position:fixed;left:var(--mixer-left,8px);right:auto;top:var(--mixer-top,76px);z-index:40;width:min(340px,calc(100vw - 16px));max-height:min(550px,calc(100dvh - var(--mixer-top,76px) - 8px));overflow:auto;overscroll-behavior:contain;background:#fff;border:1px solid #c8d1df;border-radius:12px;box-shadow:0 8px 26px #14203638;padding:12px}
+#mixerToolbar{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:12px}
+#mixerToolbar strong{font-size:14px}
+#mixerClear{width:30px;height:30px;display:inline-flex;align-items:center;justify-content:center;padding:4px;border:1px solid #d7dfe8;border-radius:6px;color:#40546a}
+#mixerClear svg{width:19px;height:19px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+#mixerClear:hover{background:#f0f3f8}
+#mixerMaster{display:grid;grid-template-columns:minmax(0,1fr) 142px;align-items:center;gap:10px;margin-bottom:12px;padding:9px 6px;background:#f2f6fc;border-radius:8px}
+#mixerMaster label{font-size:13px;font-weight:600}
+.gain-control{position:relative;min-width:0;display:flex;align-items:center}
+.gain-control input[type="range"]{width:100%;min-width:0;accent-color:#1760a1}
+.gain-value{position:absolute;bottom:calc(100% + 7px);left:clamp(18px,var(--gain-position,50%),calc(100% - 18px));transform:translateX(-50%);background:#24334d;color:#fff;border-radius:5px;padding:4px 5px;font-size:11px;line-height:1.15;font-variant-numeric:tabular-nums;opacity:0;visibility:hidden;pointer-events:none;white-space:nowrap}
+.gain-control:hover .gain-value,.gain-control:focus-within .gain-value,.gain-control.is-adjusting .gain-value{opacity:1;visibility:visible}
+#mixerTracks{display:grid;gap:4px}
+.mixer-track{display:grid;grid-template-columns:22px minmax(0,1fr) 80px;gap:8px;align-items:center;padding:6px 3px;border-bottom:1px solid #eef0f5}
+.mixer-track span{font-size:13px;overflow-wrap:anywhere}
+.mixer-track input[type="range"]{width:100%;min-width:0;accent-color:#1678dc}
+.mixer-track input[type="checkbox"]{width:17px;height:17px;accent-color:#1678dc}
+.mixer-track input[type="range"]:disabled{opacity:.35}
+#speedDetails{position:relative;flex:none}
+#speedDetails summary{padding:7px 5px;cursor:pointer;border-radius:6px;list-style:none;white-space:nowrap;font-variant-numeric:tabular-nums;font-size:12px}
+#speedDetails summary::-webkit-details-marker{display:none}
+#speedDetails[open] summary,#speedDetails summary:hover{background:#eaf0f8}
+#speedPopover{position:absolute;bottom:calc(100% + 7px);right:0;z-index:20;background:white;border:1px solid #dce1ea;box-shadow:0 5px 18px #14203633;border-radius:9px;padding:12px;min-width:205px}
+#speedPopover label{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;font-size:13px}
+#speedPopover input{grid-column:1 / -1;width:100%;accent-color:#1760a1}
+.measure-seek{flex:0 1 132px}
+.measure-seek input{width:100%;min-width:55px;accent-color:#1678dc}
+#position{flex:none;font-size:12px;white-space:nowrap}
+a{color:#1760a1}
+main{display:flex;flex:1;min-height:0;min-width:0;width:100%;overflow:hidden}
+#notation{height:100%;min-width:0;overflow:auto;overscroll-behavior:contain;padding:14px}
+#pages{display:flex;flex-direction:column;gap:18px;align-items:center;min-width:100%;width:max-content;margin:0 auto}
+.page{position:relative;flex:none;padding:0;background:white;box-shadow:0 2px 12px #14203629;text-align:center}
+.page img{width:100%;height:auto;display:block;user-select:none}
+.measure-layer{position:absolute;inset:0;width:100%;height:100%;overflow:visible}
+.measure-region{fill:transparent;cursor:pointer}
+.measure-region.active{fill:#cf4242;fill-opacity:.22;stroke:#b53636;stroke-opacity:.35;stroke-width:.13;pointer-events:all}
+.measure-region:focus{outline:none}
+.measure-region:focus-visible{stroke:#1669b2;stroke-width:.22;stroke-opacity:1}
+#sidebar{width:360px;max-width:35vw;min-width:0;flex:none;border-left:1px solid #dce1ea;background:#fff;display:flex;flex-direction:column;overflow:hidden}
+#sidebar.is-collapsed{display:none}
+#sidebar-head{padding:12px 16px;border-bottom:1px solid #e1e6ef;display:grid;gap:6px}
+#sidebar-head p{margin:0;font-size:13px}
+#sidebar-body{overflow:auto;overscroll-behavior:contain;padding:4px 16px 24px;flex:1}
+#readme{font-size:14px;line-height:1.6;overflow-wrap:anywhere}
+#readme table{display:block;overflow-x:auto;border-collapse:collapse}
+#readme th,#readme td{border:1px solid #d4dce5;padding:6px 12px}
+#readme th{background:#f4f6f9}#readme pre{overflow-x:auto;padding:12px;background:#f2f5f9;border-radius:6px}
+#readme code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+#readme img{max-width:100%;height:auto}
+#readme h1,#readme h2,#readme h3{margin-top:1.3em;border-bottom:1px solid #e1e6ef;padding-bottom:.25em}
+#readme blockquote{border-left:3px solid #b0bac9;margin-left:0;padding-left:14px;color:#5c6c7f}
+.muted{color:#66768b;font-size:13px}
+#message{padding:14px;margin:0 auto;max-width:1140px}#message:empty{display:none}
+@media(min-width:801px) and (max-width:1060px){
+  header{padding:6px 8px}.row{gap:5px}
+  .picker{flex-basis:130px}.picker select{padding:5px}
+  #audio-cluster{min-width:275px}
+  .measure-seek{flex-basis:90px}
+  #position{font-size:11px}
+}
+@media(max-width:800px){
+  body{height:auto;min-height:100dvh;display:block;overflow:visible;padding-bottom:56px}
+  header{position:sticky;top:0;padding:6px 8px;z-index:12}
+  .titlebar{grid-template-columns:28px minmax(0,1fr) 1px;gap:6px;margin-bottom:6px}
+  h1{font-size:14px;line-height:23px;text-align:left}
+  #headingGroup{text-align:left}
+  #orchestraLine{display:none}
+  .catalog-link{width:28px;height:28px}
+  .side-toggle{display:none}
+  .row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px}
+  .picker{display:flex;align-items:center;gap:4px;min-width:0;font-size:12px}
+  .picker select{width:100%;min-width:0;padding:6px 20px 6px 6px;font-size:13px;height:35px}
+  .measure-seek{display:none}
+  #position{display:none}
+  #audio-cluster{position:fixed;bottom:0;left:0;right:0;z-index:25;background:#fff;border-top:1px solid #dce1ea;padding:5px 7px 6px;height:56px;gap:4px;min-width:0;box-shadow:0 -2px 12px #14203618}
+  #mediaControls{flex:1;width:100%;min-width:0;height:38px}
+  #mediaTime{font-size:11px}
+  #mediaSeek{width:45px}
+  #restart{height:38px;width:38px}
+  #speedDetails summary{min-width:47px;text-align:center}
+  #mixerDetails{position:static}
+  #mixerDetails>summary{width:36px;height:35px;padding:6px}
+  #mixerPanel{position:fixed;top:auto;bottom:60px;left:8px;right:8px;width:auto;max-height:55dvh}
+  main{display:block;width:100%;overflow:visible}
+  #notationPane{height:calc(100dvh - 148px);min-height:54dvh}
+  #zoomControls{display:none}
+  #notation{height:100%;overflow:auto;overscroll-behavior:contain;padding:6px;background:#eef0f4}
+  #pages,#notation[data-kind="score"] #pages,#notation[data-kind="concert-score"] #pages{min-width:0;width:100%;max-width:100%;gap:10px}
+  .page{width:100%;max-width:100%}
+  #sidebar,#sidebar.is-collapsed{display:block;width:100%;max-width:none;height:auto;overflow:visible;border:0;border-top:1px solid #dce1ea}
+  #sidebar-head{padding:12px;border:0}
+  #sidebar-body{padding:0 12px 20px;overflow:visible}
+  #readme{font-size:14px}
+}
+</style></head>
+<body>
+<header>
+<div class="titlebar">
+  <a id="catalogLink" class="catalog-link" aria-disabled="true" title="Каталог партитур ещё не настроен" aria-label="Каталог партитур" tabindex="-1">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14 5-7 7 7 7M7 12h14"/></svg>
+  </a>
+  <div id="headingGroup"><h1 id="heading">Партитура</h1><p id="orchestraLine" hidden></p></div>
+  <button id="sidebarToggle" class="side-toggle" type="button" title="Скрыть описание" aria-controls="sidebar" aria-expanded="true">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></svg>
+  </button>
+</div>
+<div class="row">
+<label class="picker"><select id="view" aria-label="Выбор нот" disabled><option>Загрузка…</option></select></label>
+<input id="track" type="hidden" value="">
+<details id="mixerDetails">
+ <summary id="mixerToggle" role="button" aria-label="Микшер" title="Микшер">
+  <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+   <path d="M4 6h16M4 12h16M4 18h16"/>
+   <circle cx="9" cy="6" r="2.5" fill="#f7f9fc"/>
+   <circle cx="16" cy="12" r="2.5" fill="#f7f9fc"/>
+   <circle cx="11" cy="18" r="2.5" fill="#f7f9fc"/>
+  </svg>
+  <span id="mixerCount" hidden></span>
+ </summary>
+ <div id="mixerPanel" aria-label="Микшер звуков">
+   <div id="mixerToolbar">
+     <strong>Микшер</strong>
+     <button id="mixerClear" type="button" title="Отключить все дорожки" aria-label="Отключить все дорожки">
+       <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="5" width="16" height="14" rx="2"/><path d="M8 9l8 6M16 9l-8 6"/></svg>
+     </button>
+   </div>
+   <div id="mixerMaster">
+     <label for="masterVolume">Общая громкость</label>
+     <div class="gain-control">
+       <input id="masterVolume" type="range" min="0" max="1" step="0.01" value="1" aria-label="Общая громкость">
+       <output id="masterGainValue" class="gain-value" for="masterVolume">100%</output>
+     </div>
+   </div>
+   <div id="mixerTracks"></div>
+ </div>
+</details>
+<div id="audio-cluster">
+<button id="restart" type="button" title="К началу" aria-label="К началу">
+<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M5 5h2v14H5zM19 5v14L8 12z"/></svg>
+</button>
+<audio id="audio" preload="metadata"></audio>
+<div id="mediaControls" role="group" aria-label="Аудиоплеер">
+  <button id="playPause" class="media-button" type="button" aria-label="Воспроизвести" title="Воспроизвести" disabled>▶</button>
+  <span id="mediaTime">0:00 / 0:00</span>
+  <input id="mediaSeek" type="range" min="0" max="0" step="0.05" value="0" aria-label="Положение аудиозаписи" disabled>
+</div>
+<details id="speedDetails"><summary id="speedSummary" title="Скорость воспроизведения">100%</summary>
+<div id="speedPopover"><label>Скорость <output id="speedValue" for="speed">100%</output>
+<input id="speed" type="range" min="0.5" max="2" step="0.05" value="1" aria-label="Скорость воспроизведения"></label></div>
+</details>
+</div>
+<label class="measure-seek">Такт <input id="seek" type="range" min="0" value="0" max="0" disabled></label>
+<span id="position" class="muted"></span>
+
+</div>
+</header>
+<main>
+<section id="notationPane" aria-label="Просмотр нот">
+<div id="zoomControls" role="group" aria-label="Масштаб нот">
+  <button id="zoomOut" type="button" title="Уменьшить" aria-label="Уменьшить масштаб">−</button>
+  <input id="zoomSlider" type="range" min="50" max="250" step="10" value="100" aria-label="Масштаб относительно высоты экрана">
+  <button id="zoomIn" type="button" title="Увеличить" aria-label="Увеличить масштаб">+</button>
+  <button id="zoomFit" type="button" title="Подогнать страницу по высоте" aria-label="По высоте">⤢</button>
+  <output id="zoomValue" for="zoomSlider">100%</output>
+</div>
+<div id="notation" aria-label="Нотные страницы" tabindex="0">
+ <div id="message" role="status"></div>
+ <div id="pages"></div>
+</div>
+</section>
+<aside id="sidebar" aria-label="Информация о партитуре">
+ <div id="sidebar-head">
+  <p id="version" class="muted">Загрузка актуального релиза…</p>
+  <p><a id="repository" href="#" target="_blank" rel="noopener" hidden>Репозиторий</a> · <a id="release" href="#" target="_blank" rel="noopener" hidden>Релизы и PDF</a></p>
+ </div>
+ <div id="sidebar-body"><article id="readme">Загрузка…</article></div>
+</aside>
+</main>
+<script src="https://cdn.jsdelivr.net/npm/marked@15.0.12/marked.min.js" defer></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js" defer></script>
+<script src="./readme-links.js" defer></script>
+<script src="./mixer-selection.js" defer></script>
+<script src="./page-zoom.js" defer></script>
+<script src="./audio-buffer.js" defer></script>
+<script src="./measure-spans.js" defer></script>
+<script src="./app.js" defer></script>
+</body></html>

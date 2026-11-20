@@ -1,0 +1,822 @@
+#!/usr/bin/env python3
+"""Build version-independent notation hashes and SVG + MIDI-timed measure data.
+
+LilyPond is the notation source of truth.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+import zipfile
+from pathlib import Path
+
+import build as b
+
+ROOT = b.ROOT
+VIEWER = ROOT / "dist" / "viewer"
+SCHEMA = "score-viewer-v2"
+SVG_NS = "http://www.w3.org/2000/svg"
+ET.register_namespace("", SVG_NS)
+
+
+def digest(blob: bytes) -> str:
+    return hashlib.sha256(blob).hexdigest()
+
+
+def read_vlq(data: bytes, at: int) -> tuple[int, int]:
+    number = 0
+    for _ in range(4):
+        if at >= len(data):
+            raise ValueError("Truncated MIDI variable-length quantity")
+        byte = data[at]
+        at += 1
+        number = (number << 7) | (byte & 127)
+        if byte < 128:
+            return number, at
+    raise ValueError("Invalid MIDI VLQ")
+
+
+def midi_events(file: Path) -> tuple[int, list[tuple[int, str, int, bytes]]]:
+    """Track-aware SMF reader: ignore track names and other nonmusical text."""
+    blob = file.read_bytes()
+    if blob[:4] != b"MThd" or len(blob) < 14:
+        raise ValueError("Missing MIDI header: " + str(file))
+    hlen = struct.unpack_from(">I", blob, 4)[0]
+    fmt, tracks, division = struct.unpack_from(">HHH", blob, 8)
+    if division & 0x8000:
+        raise ValueError("SMPTE MIDI timing is not supported yet")
+    if fmt not in (0, 1):
+        raise ValueError("Only type 0/1 MIDI supported")
+    pos = 8 + hlen
+    events: list[tuple[int, str, int, bytes]] = []
+    for track in range(tracks):
+        if blob[pos:pos+4] != b"MTrk":
+            raise ValueError("Missing MIDI track chunk")
+        size = struct.unpack_from(">I", blob, pos + 4)[0]
+        at, end = pos + 8, pos + 8 + size
+        if end > len(blob):
+            raise ValueError("Truncated MIDI track")
+        tick = 0
+        running = 0
+        while at < end:
+            dt, at = read_vlq(blob, at)
+            tick += dt
+            status = blob[at]
+            if status & 128:
+                at += 1
+                if status < 240:
+                    running = status
+            elif running:
+                status = running
+            else:
+                raise ValueError("MIDI running status without previous event")
+            if status == 255:
+                typ = blob[at]
+                at += 1
+                count, at = read_vlq(blob, at)
+                content = blob[at:at+count]
+                at += count
+                if typ == 81 and len(content) == 3:
+                    events.append((tick, "tempo", track, content))
+                elif typ == 88 and len(content) >= 2:
+                    events.append((tick, "meter", track, content[:2]))
+                elif typ == 6:
+                    events.append((tick, "marker", track, content))
+                continue
+            if status in (240, 247):
+                count, at = read_vlq(blob, at)
+                at += count
+                running = 0
+                continue
+            kind = status & 240
+            n = 1 if kind in (192, 208) else 2
+            content = blob[at:at+n]
+            at += n
+            if len(content) != n:
+                raise ValueError("Truncated MIDI event")
+            events.append((tick, "channel", track, bytes([status]) + content))
+        pos = end
+    return division, sorted(events, key=lambda e: (e[0], e[2], e[1], e[3]))
+
+
+def music_digest(file: Path) -> str:
+    division, events = midi_events(file)
+    normalized = [
+        [tick, typ, track, content.hex()]
+        for tick, typ, track, content in events
+    ]
+    return digest(json.dumps([division, normalized], separators=(",", ":")).encode())
+
+
+
+def playback_print_map() -> tuple[list[int] | None, int | None, int | None]:
+    """Read optional printed count and legacy route (if still configured).
+
+    A LilyPond/MIDI-marker route does not require playback_sections in JSON.
+    Work-specific validation can keep printed_measures and a count guard.
+    """
+    config = ROOT / "music" / "playback-map.json"
+    if not config.is_file():
+        return None, None, None
+    document = json.loads(config.read_text(encoding="utf-8"))
+    printed = int(document["printed_measures"])
+    if printed <= 0:
+        raise ValueError("printed_measures must be positive")
+    expected = document.get("expected_playback_measures")
+    if expected is not None and (not isinstance(expected, int) or expected <= 0):
+        raise ValueError("expected_playback_measures must be a positive integer")
+    sections = document.get("playback_sections")
+    if sections is None:
+        return None, printed, expected
+    playback: list[int] = []
+    for section in sections:
+        start, end = int(section["start"]), int(section["end"])
+        if not 1 <= start <= end <= printed:
+            raise ValueError(f"Invalid repeat section {section}")
+        playback.extend(range(start, end + 1))
+    if not playback or set(playback) != set(range(1, printed + 1)):
+        raise ValueError("Playback map omits some printed measures")
+    return playback, printed, expected
+
+def make_timeline(file: Path) -> dict:
+    """Compute exact MIDI-clock measure intervals, including tempo changes.
+
+    A time-signature change must occur at a measure boundary. Repeats may
+    create multiple playback visits and will need an explicit notation map.
+    """
+    playback_map, printed_measure_count, expected_playback_count = playback_print_map()
+    division, events = midi_events(file)
+    timings = [(0, 500000)]
+    meters = [(0, 4, 4)]
+    max_tick = 0
+    for tick, typ, track, content in events:
+        if typ == "tempo":
+            tempo = int.from_bytes(content, "big")
+            if tempo > 0:
+                timings.append((tick, tempo))
+        elif typ == "meter":
+            meters.append((tick, content[0], 1 << content[1]))
+        elif typ == "channel":
+            max_tick = max(max_tick, tick)
+    # Identical meta events in multiple parts are redundant; last at a tick wins.
+    tempos = dict(timings)
+    tempo_points = sorted(tempos.items())
+    meter_points = sorted({m[0]: (m[1], m[2]) for m in meters}.items())
+
+    def seconds(tick: int) -> float:
+        prior_tick, micros = 0, 500000
+        elapsed = 0.0
+        for point, new_micros in tempo_points:
+            if point > tick:
+                break
+            elapsed += (point - prior_tick) * micros / (division * 1_000_000)
+            prior_tick, micros = point, new_micros
+        return elapsed + (tick - prior_tick) * micros / (division * 1_000_000)
+
+    out = []
+    tick = 0
+    for number in range(1, 10001):
+        current_meter = [(t, nd) for t, nd in meter_points if t <= tick][-1][1]
+        numerator, denominator = current_meter
+        bar_ticks = division * numerator * 4 // denominator
+        if bar_ticks <= 0:
+            raise ValueError("Invalid MIDI time signature")
+        following = tick + bar_ticks
+        change = next((t for t, _ in meter_points if tick < t < following), None)
+        if change is not None:
+            raise ValueError("Time-signature change mid-measure: unsupported")
+        if playback_map is not None and number > len(playback_map):
+            raise ValueError("Playback MIDI exceeds the declared repeat structure")
+        printed_number = playback_map[number - 1] if playback_map else number
+        out.append({
+            "id": f"playback-{number:04d}",
+            "printed_measure_id": f"measure-{printed_number:04d}",
+            "printed_number": printed_number,
+            "number": number,
+            "start_tick": tick,
+            "end_tick": following,
+            "start_ms": round(seconds(tick) * 1000, 3),
+            "end_ms": round(seconds(following) * 1000, 3),
+        })
+        tick = following
+        if tick >= max_tick:
+            break
+    if playback_map is not None and len(out) != len(playback_map):
+        raise ValueError(f"Expected {len(playback_map)} playback measures; got {len(out)}")
+    # Optional navigation anchors are generated by LilyPond as MIDI markers.
+    # Compare them with any existing work-specific route; never silently
+    # publish a viewer with conflicting playback/notation positions.
+    from playback_route import marker_route
+    resolved = marker_route(
+        events, [m["start_tick"] for m in out],
+        legacy_route=playback_map, legacy_printed=printed_measure_count,
+    )
+    if resolved is not None:
+        printed_route, printed_measure_count = resolved
+        for item, printed_number in zip(out, printed_route):
+            item["printed_number"] = printed_number
+            item["printed_measure_id"] = f"measure-{printed_number:04d}"
+    elif playback_map is None and printed_measure_count is not None and len(out) != printed_measure_count:
+        raise ValueError(
+            "MIDI contains a different number of measures than the printed "
+            "score, but no playback markers or explicit repeat map were found"
+        )
+    if printed_measure_count is None:
+        printed_measure_count = len(out)
+    if expected_playback_count is not None and len(out) != expected_playback_count:
+        raise ValueError(
+            f"Expected {expected_playback_count} playback measures; got {len(out)}"
+        )
+    return {
+        "schema": SCHEMA,
+        "clock_source": file.name,
+        "printed_measures": printed_measure_count,
+        "playback_measures": len(out),
+        "ticks_per_quarter": division,
+        "tempo_events": [{"tick": tick, "microseconds_per_quarter": us} for tick, us in tempo_points],
+        "time_signature_events": [
+            {"tick": tick, "numerator": m[0], "denominator": m[1]}
+            for tick, m in meter_points
+        ],
+        "measures": out,
+        "limitations": [
+            "The audio player may introduce a small MP3 encoder delay.",
+            "D.C./Fine playback occurrence maps to printed_measure_id.",
+            "Fermatas without explicit MIDI tempo changes cannot be inferred.",
+        ],
+    }
+
+
+def svg_files(directory: Path, basename: str) -> list[Path]:
+    results = list(directory.glob(basename + "*.svg"))
+    def rank(path: Path) -> tuple[int, str]:
+        m = re.search(r"(?:-page)?(\d+)\.svg$", path.name)
+        return (int(m.group(1)) if m else 1, path.name)
+    return sorted(results, key=rank)
+
+
+def render_svg(source: Path, view_id: str, naming: dict) -> list[Path]:
+    """Render directly from LilyPond with SVG-only BarNumber metadata."""
+    lily = shutil.which("lilypond")
+    if not lily:
+        raise RuntimeError("LilyPond executable missing")
+    view_dir = VIEWER / "svg" / view_id
+    view_dir.mkdir(parents=True, exist_ok=True)
+    base = naming["slug"] + "-" + view_id + "-" + naming["revision"]
+    wrapper = ROOT / "build" / "svg-source" / (view_id + ".ly")
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    # Only SVG gets tiny bar numbers on each measure. These grobs carry
+    # a class, so the rendered coordinates can be extracted reliably.
+    wrapper.write_text(
+        '\\layout {\n'
+        '  \\context { \\Score\n'
+        '    barNumberVisibility = #all-bar-numbers-visible\n'
+        '    \\override BarNumber.break-visibility = ##(#t #t #t)\n'
+        '    \\override BarNumber.font-size = #-7\n'
+        '    \\override BarNumber.output-attributes = #\'((class . "ea-measure-number"))\n'
+        '    \\override CenteredBarNumber.output-attributes = #\'((class . "ea-measure-number"))\n'
+        '  }\n'
+        '}\n'
+        f'\\include "{source.as_posix()}"\n',
+        encoding="utf-8",
+    )
+    cmd = [
+        lily, "-dbackend=svg", "-dno-point-and-click",
+        "-I", str(ROOT), "-o", str(view_dir / base), str(wrapper),
+    ]
+    env = {**os.environ, "SCORE_BUILD_REVISION": naming["revision"]}
+    if view_id in ("score", "concert-score"):
+        size = b.natural_score_staff_size(b.score_staff_count())
+        first, later = b.score_instrument_indents(size)
+        env["SCORE_INDENT_MM"] = str(first)
+        env["SCORE_SHORT_INDENT_MM"] = str(later)
+    completed = subprocess.run(cmd, cwd=ROOT, env=env, text=True,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if completed.returncode:
+        raise RuntimeError("LilyPond SVG failed: " + str(source) + "\n" + completed.stdout[-5000:])
+    print("SVG:", view_id, completed.stdout.strip()[-400:], flush=True)
+    results = svg_files(view_dir, base)
+    if not results:
+        raise RuntimeError("No SVG pages produced: " + str(source))
+    renamed = []
+    for number, path in enumerate(results, start=1):
+        target = view_dir / f"page-{number:03d}.svg"
+        path.rename(target)
+        renamed.append(target)
+    return renamed
+
+
+def _svg_translation(transform: str) -> tuple[float, float]:
+    match = re.search(r"translate\(\s*(-?[\d.]+)[,\s]+(-?[\d.]+)\s*\)", transform)
+    return (float(match.group(1)), float(match.group(2))) if match else (0., 0.)
+
+
+def _svg_staff_geometry(root: ET.Element) -> tuple[list[tuple[float, float, float, float]],
+                                                       list[tuple[float, float]]]:
+    """Extract native LilyPond staff-lines and barline rectangles.
+
+    Coordinates are SVG viewBox units, not screenshots or guessed spacing.
+    Staff lines: five consecutive horizontal SVG lines with 1-ish-unit gaps.
+    Bar-lines: tall, narrow rectangles that align to a staff's top line.
+    """
+    horizontal: list[tuple[float, float, float]] = []
+    vertical: list[tuple[float, float, float]] = []
+    for group in root:
+        if group.tag.rsplit("}", 1)[-1] != "g":
+            continue
+        gx, gy = _svg_translation(group.get("transform", ""))
+        for element in group:
+            name = element.tag.rsplit("}", 1)[-1]
+            if name == "line":
+                x1 = gx + float(element.get("x1", "0"))
+                x2 = gx + float(element.get("x2", "0"))
+                y1 = gy + float(element.get("y1", "0"))
+                y2 = gy + float(element.get("y2", "0"))
+                if abs(y1 - y2) < 0.02 and x2 - x1 > 15:
+                    horizontal.append((y1, x1, x2))
+            elif name == "rect":
+                width = float(element.get("width", "0"))
+                height = float(element.get("height", "0"))
+                if 0.05 < width < 0.40 and 3.7 < height < 5.4:
+                    vertical.append((gx + float(element.get("x", "0")),
+                                     gy + float(element.get("y", "0")), height))
+    horizontal.sort()
+    staves: list[tuple[float, float, float, float]] = []
+    i = 0
+    while i <= len(horizontal) - 5:
+        group = horizontal[i:i + 5]
+        gaps = [group[k + 1][0] - group[k][0] for k in range(4)]
+        if (all(0.65 < value < 1.36 for value in gaps)
+                and max(x[1] for x in group) - min(x[1] for x in group) < 0.25
+                and max(x[2] for x in group) - min(x[2] for x in group) < 0.25):
+            staves.append((group[0][0], group[-1][0],
+                           min(x[1] for x in group), max(x[2] for x in group)))
+            i += 5
+        else:
+            i += 1
+    return staves, [(x, y) for x, y, _height in vertical]
+
+
+def _svg_measure_systems(
+    staff: list[tuple[float, float, float, float]],
+    labels: list[tuple[int, float, float]],
+    kind: str,
+) -> list[tuple[tuple[float, float, float, float],
+                list[tuple[int, float, float]]]]:
+    """Group the physical staves that share a printed musical system.
+
+    Full scores already use a page-wide rectangle. In parts, LilyPond prints
+    bar numbers above the first staff of a PianoStaff or another multi-staff
+    group, not above every staff. A staff without its own numbers therefore
+    belongs to the preceding numbered staff, rather than starting a new row.
+
+    Repeated labels at the same horizontal position on two staves also belong
+    to one system. Different printed bar numbers start the following system.
+    No instrument names or assumed staff counts are needed.
+    """
+    if not staff:
+        return []
+    if kind in ("score", "concert-score"):
+        return [((min(s[0] for s in staff), max(s[1] for s in staff),
+                  min(s[2] for s in staff), max(s[3] for s in staff)), labels)]
+
+    rows: dict[int, list[tuple[int, float, float]]] = {}
+    for number, x, y in labels:
+        index = min(range(len(staff)), key=lambda i: abs(y - staff[i][0]))
+        if abs(y - staff[index][0]) < 11:
+            rows.setdefault(index, []).append((number, x, y))
+
+    systems: list[tuple[tuple[float, float, float, float],
+                        list[tuple[int, float, float]]]] = []
+    members: list[tuple[float, float, float, float]] = []
+    markers: list[tuple[int, float, float]] = []
+
+    def finish_system() -> None:
+        if members:
+            systems.append(((
+                min(s[0] for s in members), max(s[1] for s in members),
+                min(s[2] for s in members), max(s[3] for s in members),
+            ), markers.copy()))
+
+    for index in sorted(range(len(staff)), key=lambda i: staff[i][0]):
+        own = rows.get(index, [])
+        repeats = any(number == prior and abs(x - prior_x) < 1
+                      for number, x, _ in own
+                      for prior, prior_x, _ in markers)
+        if members and markers and own and not repeats:
+            finish_system()
+            members.clear()
+            markers.clear()
+        members.append(staff[index])
+        markers.extend(own)
+    finish_system()
+    return systems
+
+
+def _svg_measure_regions(
+    staff: list[tuple[float, float, float, float]],
+    bars: list[tuple[float, float]],
+    labels: list[tuple[int, float, float]],
+    kind: str,
+    page_idx: int,
+    carry_number: int | None = None,
+) -> tuple[list[dict], int | None]:
+    """Attach LilyPond's end-of-system bar number to the NEXT system.
+
+    A BarNumber at the far right of a system names the *following* measure.
+    That measure is printed at the far left of the next system, where LilyPond
+    may omit a duplicate number. This applies to ordinary notes and compressed
+    multimeasure rests alike, including across a page break.
+    """
+    systems = _svg_measure_systems(staff, labels, kind)
+    if not systems:
+        return [], carry_number
+    if kind in ("score", "concert-score"):
+        carry_number = None
+
+    areas: list[dict] = []
+
+    def add(number: int, left: float, right: float,
+            top: float, bottom: float) -> None:
+        if right - left < .3:
+            return
+        areas.append({
+            "measure_id": f"measure-{number:04d}", "page": page_idx,
+            "x": round(left, 3), "y": round(top - .4, 3),
+            "width": round(right - left, 3),
+            "height": round(bottom - top + .8, 3),
+        })
+
+    for (top, bottom, left, right), system_labels in systems:
+        markers = sorted(system_labels, key=lambda value: value[1])
+        boundaries = sorted({round(x, 3) for x, y in bars
+                             if abs(y - top) < .42 and left - .8 <= x <= right + .8}
+                            | {round(left, 3), round(right, 3)})
+        clean: list[float] = []
+        for x in boundaries:
+            if clean and x - clean[-1] < .4:
+                clean[-1] = x
+            else:
+                clean.append(x)
+        if len(clean) < 2:
+            continue
+
+        if kind not in ("score", "concert-score") and carry_number is not None:
+            # A page break can explicitly repeat the measure number at the
+            # system start. Do not produce a second copy in that case.
+            labeled_at_start = any(
+                number == carry_number and x <= left + 1.5
+                for number, x, _y in markers
+            )
+            if not labeled_at_start:
+                end = min((x for x in clean if x > left + .3), default=right)
+                add(carry_number, left, end, top, bottom)
+            carry_number = None
+
+        for number, x, _y in markers:
+            closest = min(clean, key=lambda value: abs(value - x))
+            if x <= left + 1.5:
+                following = [value for value in clean if value > left + .3]
+                if following:
+                    add(number, left, min(following), top, bottom)
+            elif abs(x - closest) < .55:
+                next_values = [value for value in clean if value > closest + .3]
+                if next_values:
+                    add(number, closest, min(next_values), top, bottom)
+                elif kind not in ("score", "concert-score"):
+                    # This BarNumber belongs to the first physical measure
+                    # of the NEXT system, not the last of this one.
+                    carry_number = number
+                else:
+                    prev = [value for value in clean if value < closest - .3]
+                    if prev:
+                        add(number, max(prev), closest, top, bottom)
+            else:
+                # CenteredBarNumber labels a real measure inside a system.
+                begin = max((v for v in clean if v <= x), default=left)
+                finish = min((v for v in clean if v > x), default=right)
+                add(number, begin, finish, top, bottom)
+
+    return areas, carry_number
+
+
+def _page_viewbox(root: ET.Element) -> list[float]:
+    """Preserve the complete LilyPond page, including headers and footers.
+
+    The viewer overlays measure regions but must not delete page content or
+    shrink the viewBox: tempo indications and rehearsal marks can be placed
+    outside the staff geometry.
+    """
+    return [float(value) for value in root.get("viewBox", "0 0 210 297").split()]
+
+
+
+
+def coalesce_svg_measure_regions(regions: list[dict]) -> list[dict]:
+    """One logical seek target per printed measure, even with two staves.
+
+    LilyPond can draw the same measure number twice on a two-staff system
+    (or repeat it at a system/page boundary). These are alternate graphic
+    regions of the SAME musical measure, not extra musical time. Regions
+    that overlap horizontally on one page are joined across staves. For a
+    repeated boundary label, prefer the later physical occurrence where
+    the bar actually begins. No MIDI or notated duration is modified.
+    """
+    unique: dict[str, dict] = {}
+    for candidate in regions:
+        key = candidate["measure_id"]
+        prior = unique.get(key)
+        if prior is None:
+            unique[key] = candidate.copy()
+            continue
+        if prior["page"] == candidate["page"]:
+            prior_left, prior_right = prior["x"], prior["x"] + prior["width"]
+            new_left = candidate["x"]
+            new_right = new_left + candidate["width"]
+            overlap = max(0.0, min(prior_right, new_right)
+                          - max(prior_left, new_left))
+            if overlap >= .6 * min(prior["width"], candidate["width"]):
+                left = min(prior_left, new_left)
+                top = min(prior["y"], candidate["y"])
+                unique[key] = {
+                    "measure_id": key, "page": prior["page"],
+                    "x": round(left, 3), "y": round(top, 3),
+                    "width": round(max(prior_right, new_right) - left, 3),
+                    "height": round(max(prior["y"] + prior["height"],
+                                        candidate["y"] + candidate["height"])
+                                    - top, 3),
+                }
+                continue
+        # A duplicated number at a new system/page is not a second bar.
+        # Later SVG order corresponds to the actual following system.
+        unique[key] = candidate.copy()
+    return list(unique.values())
+
+
+def annotate_measure_spans(regions: list[dict],
+                           printed_measures: int) -> None:
+    """Attach the complete printed span represented by each visible region.
+
+    Multimeasure rests occupy *one* LilyPond physical measure even though
+    their music lasts several printed bars. The gap up to the next visible
+    printed measure belongs to that same rectangle, including when the rest
+    is the last symbol on a system/page. Geometry is never extended past the
+    physical region; only its time interval changes.
+    """
+    ordered = sorted(regions, key=lambda region:
+                     int(region["measure_id"].removeprefix("measure-")))
+    previous = 0
+    for index, region in enumerate(ordered):
+        number = int(region["measure_id"].removeprefix("measure-"))
+        if not previous < number <= printed_measures:
+            raise ValueError(f"Invalid or repeated printed bar region: {number}")
+        next_number = (int(ordered[index + 1]["measure_id"].removeprefix("measure-"))
+                       if index + 1 < len(ordered) else printed_measures + 1)
+        if not number < next_number <= printed_measures + 1:
+            raise ValueError(f"Invalid printed measure sequence: {number}, {next_number}")
+        region["last_printed_measure"] = next_number - 1
+        previous = number
+
+
+
+def _center_page_titles(root: ET.Element, title: str, subtitle: str) -> None:
+    """Center SVG title text with the browser's actual font metrics.
+
+    LilyPond places text using the print font's measured width. When the SVG
+    browser substitutes a font, the original left edge no longer centers it.
+    Use SVG text-anchor instead, and place the text origin at the page center.
+    Only the exact book title/subtitle are touched, never music or tempo text.
+    """
+    viewbox = _page_viewbox(root)
+    center = viewbox[0] + viewbox[2] / 2
+    wanted = {value.strip() for value in (title, subtitle) if value.strip()}
+    if not wanted:
+        return
+    for group in list(root):
+        if group.tag.rsplit("}", 1)[-1] != "g":
+            continue
+        texts = [node for node in group.iter()
+                 if node.tag.rsplit("}", 1)[-1] == "text"]
+        if len(texts) != 1 or "".join(texts[0].itertext()).strip() not in wanted:
+            continue
+        # LilyPond emits each text stencil in a translated top-level group.
+        # Moving its origin to the page midpoint and using text-anchor avoids
+        # relying on the original font's width.
+        match = re.fullmatch(
+            r"\s*translate\(\s*(-?[\d.]+)[,\s]+(-?[\d.]+)\s*\)\s*",
+            group.get("transform", ""),
+        )
+        if match is None:
+            continue
+        text_node = texts[0]
+        # Text is normally at x=0 within the translated group. Preserve any
+        # local x offset, and make the center of the rendered text the anchor.
+        local_x = float(text_node.get("x", "0"))
+        group.set("transform", f"translate({center - local_x:.4f},{match.group(2)})")
+        text_node.set("text-anchor", "middle")
+
+
+def tag_svg(pages: list[Path], timeline: dict, kind: str,
+            revision: str) -> tuple[list[dict], list[dict], dict]:
+    """Index native SVG measure numbers AND real barline-to-barline regions."""
+    anchors: list[dict] = []
+    regions: list[dict] = []
+    page_boxes: dict[str, list[float]] = {}
+    allowed = {m["printed_number"] for m in timeline["measures"]}
+    carry_number: int | None = None
+    for page_idx, file in enumerate(pages, start=1):
+        doc = ET.parse(file)
+        root = doc.getroot()
+        labels: list[tuple[int, float, float]] = []
+        for group in root.iter():
+            if group.tag.rsplit("}", 1)[-1] != "g":
+                continue
+            if "ea-measure-number" not in group.get("class", "").split():
+                continue
+            content = "".join(group.itertext()).strip()
+            matches = re.findall(r"\d+", content)
+            if not matches:
+                continue
+            number = int(matches[0])
+            if number not in allowed:
+                continue
+            identifier = f"measure-{number:04d}"
+            if any(a["measure_id"] == identifier and a["page"] == page_idx for a in anchors):
+                continue
+            group.set("id", identifier)
+            group.set("data-measure-id", identifier)
+            anchors.append({"measure_id": identifier, "page": page_idx,
+                            "element_id": identifier})
+            child = next(iter(group), None)
+            if child is not None:
+                x, y = _svg_translation(child.get("transform", ""))
+                labels.append((number, x, y))
+        staves, barlines = _svg_staff_geometry(root)
+        found, carry_number = _svg_measure_regions(
+            staves, barlines, labels, kind, page_idx, carry_number
+        )
+        regions.extend(found)
+        if page_idx == 1:
+            meta = b.metadata()
+            _center_page_titles(root, meta.get("workTitle", ""),
+                                meta.get("workSubtitle", ""))
+        page_boxes[str(page_idx)] = _page_viewbox(root)
+        doc.write(file, encoding="utf-8", xml_declaration=True)
+    # On the final system there is no following system to receive a
+    # terminal bar number. If it is the final printed measure, use the last
+    # physical barline-to-barline cell instead of losing the final highlight.
+    final_systems = _svg_measure_systems(staves, labels, kind) if pages else []
+    if (carry_number == timeline["printed_measures"] and final_systems and
+            not any(a["measure_id"] == f"measure-{carry_number:04d}" for a in regions)):
+        (top, bottom, left, right), _ = final_systems[-1]
+        boundaries = sorted({round(x, 3) for x, y in barlines
+                             if abs(y-top)<.42 and left-.8<=x<=right+.8}
+                            | {round(left, 3),round(right, 3)})
+        previous = [x for x in boundaries if x < right-.4]
+        if previous:
+            x = max(previous)
+            regions.append({
+                "measure_id": f"measure-{carry_number:04d}",
+                "page": len(pages), "x": round(x,3),
+                "y": round(top-.4,3),
+                "width": round(right-x,3),
+                "height": round(bottom-top+.8,3),
+            })
+    regions = coalesce_svg_measure_regions(regions)
+    annotate_measure_spans(regions, timeline["printed_measures"])
+    if not regions:
+        print(f"WARNING: {kind}: no safe barline areas recovered; "
+              "click-to-seek remains available through the timeline slider")
+    return anchors, regions, page_boxes
+
+
+
+def main() -> None:
+    naming = b.current_names()
+    parts = b.instruments()
+    combined = b.combined_parts()
+    if VIEWER.exists():
+        shutil.rmtree(VIEWER)
+    VIEWER.mkdir(parents=True)
+    shutil.copy2(b.FRAMEWORK / "viewer" / "index.html", VIEWER / "index.html")
+    timeline = make_timeline(b.BUILD / "midi" / (naming["mix"] + ".midi"))
+    (VIEWER / "timeline.json").write_text(
+        json.dumps(timeline, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
+    )
+    ordered_parts = sorted([*parts, *combined], key=b.part_sort_key)
+    sources = [
+        ("score", ROOT / "score.ly", "score", None),
+        ("concert-score", ROOT / "concert-score.ly", "concert-score", None),
+    ] + [
+        (("combined-" + part.stem if part.parent.name == "combined" else part.stem),
+         part, "combined" if part.parent.name == "combined" else "individual", part)
+        for part in ordered_parts
+    ]
+    from notation_hash import music_fingerprint, print_fingerprint
+    from view_audio import load_audio_overrides, infer_audio_ids
+    overrides = load_audio_overrides(ROOT)
+    source_ids = {record[0] for record in sources}
+    unknown_views = set(overrides) - source_ids
+    if unknown_views:
+        raise RuntimeError(f"Unknown view IDs in music/view-audio-map.json: {sorted(unknown_views)}")
+    audio_ids = {"mix", *(part.stem for part in parts)}
+    views = {}
+    notation = {}
+    for view_id, source, kind, part in sources:
+        pages = render_svg(source, view_id, naming)
+        anchors, regions, page_boxes = tag_svg(pages, timeline, kind, naming["revision"])
+        if kind in ("score", "concert-score"):
+            expected = timeline["printed_measures"]
+            covered = len({a["measure_id"] for a in regions})
+            if covered != expected:
+                raise RuntimeError(
+                    f"Interactive {view_id} has {covered}/{expected} "
+                    "barline regions; refusing an inaccurate viewer export")
+        music_hash = music_fingerprint(source)
+        print_hash = print_fingerprint(source)
+        views[view_id] = {
+            "kind": kind,
+            "audio_track_ids": infer_audio_ids(view_id, kind, source, audio_ids, overrides),
+            "source": str(source.relative_to(ROOT)),
+            "pages": [str(file.relative_to(VIEWER)) for file in pages],
+            "measure_anchors": anchors,
+            "measure_areas": regions,
+            "page_viewboxes": page_boxes,
+            "anchors_found": len({a["measure_id"] for a in anchors}),
+        }
+        if kind == "score":
+            pdf_basename = naming["score"]
+        elif kind == "concert-score":
+            pdf_basename = naming["concert"]
+        else:
+            pdf_basename = b.part_name(part, naming)
+        notation[view_id] = {
+            "kind": kind,
+            "pdf": pdf_basename + ".pdf",
+            "music_hash": music_hash,
+            "print_hash": print_hash,
+        }
+    manifest = {
+        "schema": SCHEMA,
+        "revision": naming["revision"],
+        "work_slug": naming["slug"],
+        "work_title": b.metadata().get("workTitle", naming["slug"]),
+        "work_subtitle": b.metadata().get("workSubtitle", ""),
+        "orchestra_name": b.metadata().get("orchestraName", ""),
+        "audio": "../audio/" + naming["mix"] + ".mp3",
+        "audio_tracks": [
+            {
+                "id": "mix",
+                "label": "Общий звук",
+                "is_full_mix": True,
+                "path": "../audio/" + naming["mix"] + ".mp3",
+            },
+            *[
+                {
+                    "id": part.stem,
+                    "label": part.stem.replace("-", " ").title(),
+                    "path": "../audio/stems/" + b.part_name(part, naming) + ".mp3",
+                }
+                for part in parts
+            ],
+        ],
+        "shared_timeline": "timeline.json",
+        "views": views,
+        "notes": [
+            "Each SVG uses printed measure IDs. Playback measures map via printed_measure_id.",
+            "Only recovered LilyPond SVG anchors have a geometric target; missing anchors are never fabricated.",
+            "Audio tracks share the same MIDI-derived measure timeline; MP3 delay is not compensated.",
+        ],
+    }
+    (VIEWER / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
+    )
+    if len(manifest["audio_tracks"]) != 1 + len(parts):
+        raise RuntimeError("Audio track manifest is incomplete")
+    for track in manifest["audio_tracks"]:
+        target = (VIEWER / track["path"]).resolve()
+        if not target.is_file():
+            raise RuntimeError("Missing viewer audio track: " + str(target))
+    for name, view in views.items():
+        if view["anchors_found"] != timeline["printed_measures"]:
+            print(f"WARNING: {name}: recovered {view['anchors_found']} / "
+                  f"{timeline['printed_measures']} SVG measure anchors; "
+                  "unmatched measures remain available in the JSON/CSV clock")
+    print("SVG and synchronization data:", len(views), "views,",
+          len(timeline["measures"]), "measures")
+    for key, view in views.items():
+        print(f"  {key}: {len(view['pages'])} SVG page(s); "
+              f"{view['anchors_found']} measure anchors, "
+              f"{len(view['measure_areas'])} barline hit regions")
+
+
+if __name__ == "__main__":
+    main()
