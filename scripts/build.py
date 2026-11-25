@@ -150,13 +150,17 @@ def part_order() -> list[str]:
             if members:
                 included = members
             combined_sources.append((matches[0], included))
+        # A two-staff keyboard is one player. Resolve both adjacent
+        # printed staves while the current wrapper's first score is in scope.
+        if (part.parent.name != "combined" and len(set(matches)) == 2
+                and r"\new PianoStaff" in first_score.group(1)
+                and max(matches) == min(matches) + 1):
+            matches = [min(matches)]
         assigned.append((matches, part.parent.name != "combined", identity))
     resolved = []
     for matches, individual, identity in assigned:
         if not matches and individual:
             matches = [index for index, sources in combined_sources if identity in sources]
-        if identity == "accordion" and len(set(matches)) == 2:
-            matches = [min(matches)]
         if len(set(matches)) != 1:
             raise RuntimeError(f"Cannot identify unique orchestra staff for {identity}: {matches}")
         resolved.append((matches[0], individual, identity))
